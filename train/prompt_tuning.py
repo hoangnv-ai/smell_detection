@@ -48,6 +48,7 @@ parser.add_argument("--learning_rate", type=float, default=3e-4)
 parser.add_argument("--optimizer", type=str, default="Adamw")
 parser.add_argument("--should_log", type=bool, default=True)
 parser.add_argument("--output_dir", type=str, default="output")
+parser.add_argument("--eval_steps", type=int, default=5000)  # <-- thêm arg
 args = parser.parse_args()
 
 os.makedirs(args.output_dir, exist_ok=True)
@@ -69,7 +70,6 @@ logging.basicConfig(
 )
 
 logging.getLogger().handlers[0].setLevel(logging.WARNING)
-
 logger.setLevel(logging.INFO if args.should_log else logging.WARN)
 
 content_write = "=" * 50 + "\n"
@@ -87,13 +87,13 @@ content_write += f"learning_rate {args.learning_rate:.0e}\n"
 content_write += f"optimizer: {args.optimizer}\n"
 content_write += f"should_log: {args.should_log}\n"
 content_write += f"output_dir: {args.output_dir}\n"
+content_write += f"eval_steps: {args.eval_steps}\n"  # <-- thêm log
 content_write += "=" * 50 + "\n"
 print(content_write)
 logger.info(content_write)
 
 set_seed(args.seed)
 use_cuda = True
-
 
 # Set peft config
 peft_type = PeftType.PROMPT_TUNING
@@ -107,14 +107,12 @@ if "codet5" in args.model_name_or_path.lower():
     logging.warning("CodeT5 models are not supported yet. Please use another model.")
     sys.exit(1)
 
-
 # Load tokenizer
 padding_side = PADDING_SIDE[model_name]
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, padding_side=padding_side)
 if getattr(tokenizer, "pad_token_id") is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
-
 
 # Load datasets
 train_df = load_trainset(args.train_file, max_train_samples=args.max_train_samples, seed=args.seed)
@@ -128,16 +126,14 @@ datasets = DatasetDict({
     'validation': evalset
 })
 
-
 # Get the number of labels
 label_list = train_df["label"].unique()
 num_labels = len(label_list)
 
-
 # Tokenize datasets
 if args.max_seq_length > tokenizer.model_max_length:
     logging.warning(
-        f"The max_seq_length passed ({args.max_seq_length}) is larger than the mixmum length for the "
+        f"The max_seq_length passed ({args.max_seq_length}) is larger than the maximum length for the "
         f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
     )
 max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
@@ -179,7 +175,6 @@ valid_dataloader = DataLoader(
     collate_fn=collate_fn
 )
 
-
 # Load model
 model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=num_labels)
 
@@ -202,9 +197,43 @@ lr_scheduler = get_linear_schedule_with_warmup(
     num_training_steps=(len(train_dataloader) * args.num_epochs)
 )
 
+
+# ── helper: chạy validation, trả về avg loss ──────────────────────────────────
+def run_validation(model, valid_dataloader, use_cuda, step_label):
+    model.eval()
+    total_val_loss = 0.0
+
+    progress_bar_valid = tqdm(
+        total=len(valid_dataloader),
+        desc=f"Validation @ {step_label}",
+        position=0,
+        mininterval=1,
+        leave=True
+    )
+
+    for i, batch in enumerate(valid_dataloader):
+        batch = {k: v.cuda() for k, v in batch.items()} if use_cuda else batch
+        with torch.no_grad():
+            outputs = model(**batch)
+            total_val_loss += outputs.loss.item()
+        if i % 5 == 0:
+            progress_bar_valid.update(5)
+
+    progress_bar_valid.close()
+    model.train()
+    return total_val_loss / len(valid_dataloader)
+
+
 total_steps = 0
 best_validation_loss = float("inf")
 peak_memory = 0
+
+# Dùng 1 path cố định, overwrite mỗi lần save → tiết kiệm disk
+checkpoint_path = os.path.join(args.output_dir, model_name, f"prompt_tuning_seed_{args.seed}", "latest_checkpoint")
+best_model_path  = os.path.join(args.output_dir, model_name, f"prompt_tuning_seed_{args.seed}", "best_model")
+os.makedirs(checkpoint_path, exist_ok=True)
+os.makedirs(best_model_path, exist_ok=True)
+
 if use_cuda:
     model.cuda()
 
@@ -215,7 +244,7 @@ for epoch in range(args.num_epochs):
     train_loss = 0.0
 
     progress_bar_train = tqdm(
-        total=len(train_dataloader), 
+        total=len(train_dataloader),
         desc=f"Training epoch {epoch + 1}",
         position=0,
         mininterval=1,
@@ -234,62 +263,41 @@ for epoch in range(args.num_epochs):
         optimizer.zero_grad()
 
         if step % 5 == 0:
-            progress_bar_train.set_postfix({"loss": loss.item()})
+            progress_bar_train.set_postfix({"loss": loss.item(), "global_step": total_steps})
             progress_bar_train.update(5)
 
-        current_memory = torch.cuda.max_memory_allocated() 
+        current_memory = torch.cuda.max_memory_allocated()
         if current_memory > peak_memory:
             peak_memory = current_memory
+
+        # ── Eval + checkpoint mỗi eval_steps ──────────────────────────────────
+        if total_steps % args.eval_steps == 0:
+            avg_val_loss = run_validation(model, valid_dataloader, use_cuda, step_label=f"step {total_steps}")
+
+            logger.info(f"Step {total_steps} | Epoch {epoch + 1} - Validation loss: {avg_val_loss:.6f}")
+            print(f"Step {total_steps} | Epoch {epoch + 1} - Validation loss: {avg_val_loss:.6f}")
+
+            # Overwrite checkpoint duy nhất (tiết kiệm disk)
+            model.save_pretrained(checkpoint_path)
+            logger.info(f"Checkpoint overwritten at step {total_steps} → {checkpoint_path}")
+
+            # Cập nhật best model nếu tốt hơn
+            if avg_val_loss < best_validation_loss:
+                best_validation_loss = avg_val_loss
+                model.save_pretrained(best_model_path)
+                logger.info(f"New best model saved at step {total_steps} (val_loss={avg_val_loss:.6f})")
 
     progress_bar_train.close()
 
     avg_train_loss = train_loss / len(train_dataloader)
-    logger.info(f"Epoch {epoch + 1} - Training loss: {avg_train_loss}")
-    print(f"Epoch {epoch + 1} - Training loss: {avg_train_loss}")
-
-    # Validation
-    model.eval()
-    total_validation_loss = 0.0
-
-    progress_bar_valid = tqdm(
-        total=len(valid_dataloader),
-        desc=f"Validation epoch {epoch + 1}",
-        position=0,
-        mininterval=1,
-        leave=True
-    )
-
-    for step, batch in enumerate(valid_dataloader):
-        batch = {k: v.cuda() for k, v in batch.items()} if use_cuda else batch
-        with torch.no_grad():
-            outputs = model(**batch)
-            loss = outputs.loss
-            total_validation_loss += loss.item()
-
-        if step % 5 == 0:
-            progress_bar_valid.update(5)
-    progress_bar_valid.close()
-
-    avg_validation_loss = total_validation_loss / len(valid_dataloader)
-    if avg_validation_loss < best_validation_loss:
-        best_validation_loss = avg_validation_loss
-        best_model_path = os.path.join(args.output_dir, model_name, f"prompt_tuning_seed_{args.seed}", "best_model")
-        os.makedirs(best_model_path, exist_ok=True)
-        model.save_pretrained(best_model_path)
-
-    logger.info(f"Epoch {epoch + 1} - Validation loss: {avg_validation_loss}")
-    print(f"Epoch {epoch + 1} - Validation loss: {avg_validation_loss}")
-
-    save_path = os.path.join(args.output_dir, model_name, f"prompt_tuning_seed_{args.seed}", f"epoch_{epoch + 1}")
-    os.makedirs(save_path, exist_ok=True)
-    model.save_pretrained(save_path)
+    logger.info(f"Epoch {epoch + 1} - Avg training loss: {avg_train_loss:.6f}")
+    print(f"Epoch {epoch + 1} - Avg training loss: {avg_train_loss:.6f}")
 
 with open(f"{args.output_dir}/{model_name}/peak_memory.txt", "a") as f:
-    f.write(f"prompt tuning: {str(peak_memory)}")
+    f.write(f"prompt tuning: {str(peak_memory)}\n")
 
 end_time = time.time()
-
 training_time = end_time - start_time
 
 with open(f"{args.output_dir}/{model_name}/training_time.txt", "a") as f:
-    f.write(f"epoch: {args.num_epochs} prompt tuning: {str(training_time)}")
+    f.write(f"epoch: {args.num_epochs} prompt tuning: {str(training_time)}\n")
