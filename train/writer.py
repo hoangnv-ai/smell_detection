@@ -1,0 +1,18 @@
+def gen_content_write(args):
+    content_write = "=" * 50 + "\n"
+    content_write += "Prompt Tuning\n"
+    content_write += f"seed: {args.seed}\n"
+    content_write += f"model_name_or_path: {args.model_name_or_path}\n"
+    content_write += f"train_file: {args.train_file}\n"
+    content_write += f"valid_file: {args.valid_file}\n"
+    content_write += f"max_seq_length: {args.max_seq_length}\n"
+    content_write += f"batch_size: {args.batch_size}\n"
+    content_write += f"num_epochs: {args.num_epochs}\n"
+    content_write += f"max_train_samples: {args.max_train_samples}\n"
+    content_write += f"num_virtual_tokens: {args.num_virtual_tokens}\n"
+    content_write += f"learning_rate {args.learning_rate:.0e}\n"
+    content_write += f"optimizer: {args.optimizer}\n"
+    content_write += f"should_log: {args.should_log}\n"
+    content_write += f"output_dir: {args.output_dir}\n"
+    content_write += "=" * 50 + "\n"
+    return content_write
