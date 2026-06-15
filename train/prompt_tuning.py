@@ -227,6 +227,8 @@ def run_validation(model, valid_dataloader, use_cuda, step_label):
 total_steps = 0
 best_validation_loss = float("inf")
 peak_memory = 0
+accum_train_loss = 0.0      # <-- thêm
+accum_train_steps = 0 
 
 # Dùng 1 path cố định, overwrite mỗi lần save → tiết kiệm disk
 checkpoint_path = os.path.join(args.output_dir, model_name, f"prompt_tuning_seed_{args.seed}", "latest_checkpoint")
@@ -257,6 +259,9 @@ for epoch in range(args.num_epochs):
         outputs = model(**batch)
         loss = outputs.loss
         train_loss += loss.item()
+        accum_train_loss += loss.item()   # <-- thêm
+        accum_train_steps += 1            # <-- thêm
+
         loss.backward()
         optimizer.step()
         lr_scheduler.step()
@@ -272,10 +277,23 @@ for epoch in range(args.num_epochs):
 
         # ── Eval + checkpoint mỗi eval_steps ──────────────────────────────────
         if total_steps % args.eval_steps == 0:
+            avg_train_loss_interval = accum_train_loss / accum_train_steps if accum_train_steps > 0 else 0.0
+            accum_train_loss = 0.0    # reset
+            accum_train_steps = 0     # reset
+            
             avg_val_loss = run_validation(model, valid_dataloader, use_cuda, step_label=f"step {total_steps}")
 
-            logger.info(f"Step {total_steps} | Epoch {epoch + 1} - Validation loss: {avg_val_loss:.6f}")
-            print(f"Step {total_steps} | Epoch {epoch + 1} - Validation loss: {avg_val_loss:.6f}")
+            logger.info(
+                f"Step {total_steps} | Epoch {epoch + 1} "
+                f"- Train loss: {avg_train_loss_interval:.6f} "
+                f"- Validation loss: {avg_val_loss:.6f}"
+            )
+            print(
+                f"Step {total_steps} | Epoch {epoch + 1} "
+                f"- Train loss: {avg_train_loss_interval:.6f} "
+                f"- Validation loss: {avg_val_loss:.6f}"
+            )
+
 
             # Overwrite checkpoint duy nhất (tiết kiệm disk)
             model.save_pretrained(checkpoint_path)
