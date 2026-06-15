@@ -16,7 +16,7 @@ parser.add_argument("--model_name_or_path", type=str, default="deepseek-ai/deeps
 parser.add_argument("--train_file", type=str, default="/workspace/DeepLearningSmells/dataset/ComplexConditional/train.csv")
 parser.add_argument("--valid_file", type=str, default="/workspace/DeepLearningSmells/dataset/ComplexConditional/val.csv")
 parser.add_argument("--max_seq_length", type=int, default=512)
-parser.add_argument("--batch_size", type=int, default=8)
+parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--num_epochs", type=int, default=20)
 parser.add_argument("--max_train_samples", type=int, choices=[100, 200, 500, 1000], default=None)
 parser.add_argument("--num_virtual_tokens", type=int, default=20)
